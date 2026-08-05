@@ -1,3 +1,6 @@
+# HW2_1
+# python digit_classifier.py --folder <path_to_output_folder> --checkpoint Classifier.pth
+
 import os
 import argparse
 import torch
