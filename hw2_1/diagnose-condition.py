@@ -45,7 +45,22 @@ def parse_args() -> argparse.Namespace:
         default=Path("diagnose_condition"),
     )
     parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=1.0,
+        help="Fallback value for both separate guidance scales.",
+    )
+    parser.add_argument(
+        "--digit-guidance-scale",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--dataset-guidance-scale",
+        type=float,
+        default=None,
+    )
     parser.add_argument(
         "--seeds",
         type=int,
@@ -62,6 +77,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--steps must be in [1, 1000]")
     if args.guidance_scale < 0:
         parser.error("--guidance-scale must be non-negative")
+    if (
+        args.digit_guidance_scale is not None
+        and args.digit_guidance_scale < 0
+    ):
+        parser.error("--digit-guidance-scale must be non-negative")
+    if (
+        args.dataset_guidance_scale is not None
+        and args.dataset_guidance_scale < 0
+    ):
+        parser.error("--dataset-guidance-scale must be non-negative")
     if args.save_size < 0:
         parser.error("--save-size must be non-negative")
     return args
@@ -214,7 +239,8 @@ def ddim_sample_from_noise(
     digit_labels: Tensor,
     dataset_labels: Tensor,
     steps: int,
-    guidance_scale: float,
+    digit_guidance_scale: float,
+    dataset_guidance_scale: float,
     use_bf16: bool,
 ) -> Tensor:
     """Deterministic DDIM sampling from a caller-supplied x_T."""
@@ -244,7 +270,8 @@ def ddim_sample_from_noise(
                 timesteps=timesteps,
                 digit_labels=digit_labels,
                 dataset_labels=dataset_labels,
-                guidance_scale=guidance_scale,
+                digit_guidance_scale=digit_guidance_scale,
+                dataset_guidance_scale=dataset_guidance_scale,
             )
 
         eps = eps.float()
@@ -374,6 +401,16 @@ def print_summary(seed: int, metrics: Dict[str, object]) -> None:
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
+    digit_guidance_scale = (
+        args.guidance_scale
+        if args.digit_guidance_scale is None
+        else args.digit_guidance_scale
+    )
+    dataset_guidance_scale = (
+        args.guidance_scale
+        if args.dataset_guidance_scale is None
+        else args.dataset_guidance_scale
+    )
     prepare_output_dir(args.output_dir, args.overwrite)
 
     if device.type == "cuda":
@@ -387,7 +424,8 @@ def main() -> None:
     print(f"Checkpoint global_step: {checkpoint.get('global_step')}")
     print(f"Device: {device}")
     print(f"DDIM steps: {args.steps}")
-    print(f"Guidance scale: {args.guidance_scale}")
+    print(f"Digit guidance scale: {digit_guidance_scale}")
+    print(f"Dataset guidance scale: {dataset_guidance_scale}")
     print(f"Seeds: {args.seeds}")
 
     digits = torch.arange(10, device=device, dtype=torch.long)
@@ -396,7 +434,8 @@ def main() -> None:
         "checkpoint_epoch": checkpoint.get("epoch"),
         "checkpoint_global_step": checkpoint.get("global_step"),
         "steps": args.steps,
-        "guidance_scale": args.guidance_scale,
+        "digit_guidance_scale": digit_guidance_scale,
+        "dataset_guidance_scale": dataset_guidance_scale,
         "seeds": {},
     }
     csv_rows: List[dict] = []
@@ -428,7 +467,8 @@ def main() -> None:
                 digit_labels=digits,
                 dataset_labels=datasets,
                 steps=args.steps,
-                guidance_scale=args.guidance_scale,
+                digit_guidance_scale=digit_guidance_scale,
+                dataset_guidance_scale=dataset_guidance_scale,
                 use_bf16=args.bf16,
             )
 

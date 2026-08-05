@@ -1,4 +1,4 @@
-"""Fast DDIM inference for the two-condition CFG digit model.
+"""Fast DDIM inference with separate digit and dataset CFG scales.
 
 Compared with the original inference.py:
 1. Uses DDIM with a configurable number of steps instead of 1000-step DDPM.
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=32,
+        default=8,
         help=(
             "Number of final images generated in one diffusion batch. "
             "For CFG scale > 1, the denoiser internally sees twice this batch."
@@ -91,8 +91,26 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "0=unconditional, 1=ordinary conditional, >1=CFG. "
-            "Use 1.0 to inspect an early checkpoint; high CFG amplifies errors."
+            "Fallback scale used for both conditions unless the separate "
+            "digit/dataset scales are provided."
+        ),
+    )
+    parser.add_argument(
+        "--digit-guidance-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale for eps_full - eps_dataset. Start with 1.0, then compare "
+            "1.5, 2.0, and 3.0 using classifier accuracy."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-guidance-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale for eps_dataset - eps_uncond. Dataset conditioning was "
+            "already strong, so 1.0 is the recommended first test."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -130,6 +148,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--steps must be in [1, 1000]")
     if args.guidance_scale < 0:
         parser.error("--guidance-scale must be non-negative")
+    if (
+        args.digit_guidance_scale is not None
+        and args.digit_guidance_scale < 0
+    ):
+        parser.error("--digit-guidance-scale must be non-negative")
+    if (
+        args.dataset_guidance_scale is not None
+        and args.dataset_guidance_scale < 0
+    ):
+        parser.error("--dataset-guidance-scale must be non-negative")
     if args.save_size < 0:
         parser.error("--save-size must be non-negative")
 
@@ -173,6 +201,8 @@ def load_diffusion(checkpoint_path: Path, device: torch.device):
     beta_end = float(config.get("beta_end", 2e-2))
     condition_dim = int(config.get("condition_dim", 16))
     p_uncond = float(config.get("p_uncond", 0.1))
+    p_drop_digit_only = float(config.get("p_drop_digit_only", 0.1))
+    p_drop_dataset_only = float(config.get("p_drop_dataset_only", 0.1))
 
     conditional_unet = ConditionalUNet(
         image_channels=3,
@@ -194,6 +224,8 @@ def load_diffusion(checkpoint_path: Path, device: torch.device):
         beta_end=beta_end,
         device=str(device),
         p_uncond=p_uncond,
+        p_drop_digit_only=p_drop_digit_only,
+        p_drop_dataset_only=p_drop_dataset_only,
         n_digit_classes=10,
         n_dataset_classes=2,
         null_digit_idx=NULL_DIGIT_ID,
@@ -292,18 +324,16 @@ def predict_noise(
     timesteps: Tensor,
     digit_labels: Tensor,
     dataset_labels: Tensor,
-    guidance_scale: float,
+    digit_guidance_scale: float,
+    dataset_guidance_scale: float,
 ) -> Tensor:
-    batch_size = x_t.shape[0]
+    """Hierarchical two-condition CFG.
 
-    if guidance_scale == 1.0:
-        # Ordinary conditional prediction: one B-sized model call.
-        return diffusion.model(
-            x_t,
-            timesteps,
-            digit_labels,
-            dataset_labels,
-        )
+    eps = eps_uncond
+        + dataset_scale * (eps_dataset - eps_uncond)
+        + digit_scale * (eps_full - eps_dataset)
+    """
+    batch_size = x_t.shape[0]
 
     null_digits = torch.full(
         (batch_size,),
@@ -318,7 +348,16 @@ def predict_noise(
         dtype=torch.long,
     )
 
-    if guidance_scale == 0.0:
+    # Exact special cases avoid unnecessary model calls.
+    if digit_guidance_scale == 1.0 and dataset_guidance_scale == 1.0:
+        return diffusion.model(
+            x_t,
+            timesteps,
+            digit_labels,
+            dataset_labels,
+        )
+
+    if digit_guidance_scale == 0.0 and dataset_guidance_scale == 0.0:
         return diffusion.model(
             x_t,
             timesteps,
@@ -326,21 +365,39 @@ def predict_noise(
             null_datasets,
         )
 
-    # One 2B-sized call instead of two separate B-sized calls.
-    model_input = torch.cat([x_t, x_t], dim=0)
-    model_timesteps = torch.cat([timesteps, timesteps], dim=0)
-    model_digits = torch.cat([digit_labels, null_digits], dim=0)
-    model_datasets = torch.cat([dataset_labels, null_datasets], dim=0)
+    if digit_guidance_scale == 0.0 and dataset_guidance_scale == 1.0:
+        return diffusion.model(
+            x_t,
+            timesteps,
+            null_digits,
+            dataset_labels,
+        )
 
-    predicted = diffusion.model(
+    # Evaluate full, dataset-only, and unconditional branches in one call.
+    model_input = torch.cat([x_t, x_t, x_t], dim=0)
+    model_timesteps = torch.cat([timesteps, timesteps, timesteps], dim=0)
+    model_digits = torch.cat(
+        [digit_labels, null_digits, null_digits],
+        dim=0,
+    )
+    model_datasets = torch.cat(
+        [dataset_labels, dataset_labels, null_datasets],
+        dim=0,
+    )
+
+    prediction = diffusion.model(
         model_input,
         model_timesteps,
         model_digits,
         model_datasets,
     )
-    eps_cond, eps_uncond = predicted.chunk(2, dim=0)
+    eps_full, eps_dataset, eps_uncond = prediction.chunk(3, dim=0)
 
-    return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+    return (
+        eps_uncond
+        + dataset_guidance_scale * (eps_dataset - eps_uncond)
+        + digit_guidance_scale * (eps_full - eps_dataset)
+    )
 
 
 @torch.inference_mode()
@@ -349,7 +406,8 @@ def ddim_sample(
     digit_labels: Tensor,
     dataset_labels: Tensor,
     sampling_steps: int,
-    guidance_scale: float,
+    digit_guidance_scale: float,
+    dataset_guidance_scale: float,
     use_bf16: bool,
 ) -> Tensor:
     batch_size = digit_labels.shape[0]
@@ -380,7 +438,8 @@ def ddim_sample(
                 timesteps=timesteps,
                 digit_labels=digit_labels,
                 dataset_labels=dataset_labels,
-                guidance_scale=guidance_scale,
+                digit_guidance_scale=digit_guidance_scale,
+                dataset_guidance_scale=dataset_guidance_scale,
             )
 
         eps = eps.float()
@@ -466,6 +525,17 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
 
+    digit_guidance_scale = (
+        args.guidance_scale
+        if args.digit_guidance_scale is None
+        else args.digit_guidance_scale
+    )
+    dataset_guidance_scale = (
+        args.guidance_scale
+        if args.dataset_guidance_scale is None
+        else args.dataset_guidance_scale
+    )
+
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
@@ -489,7 +559,8 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Images: {len(records):,}")
     print(f"DDIM steps: {args.steps}")
-    print(f"Guidance scale: {args.guidance_scale}")
+    print(f"Digit guidance scale: {digit_guidance_scale}")
+    print(f"Dataset guidance scale: {dataset_guidance_scale}")
     print(f"Batch size: {args.batch_size}")
     print(f"BF16: {args.bf16}")
 
@@ -518,7 +589,8 @@ def main() -> None:
             digit_labels=digit_labels,
             dataset_labels=dataset_labels,
             sampling_steps=args.steps,
-            guidance_scale=args.guidance_scale,
+            digit_guidance_scale=digit_guidance_scale,
+            dataset_guidance_scale=dataset_guidance_scale,
             use_bf16=args.bf16,
         )
 

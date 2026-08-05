@@ -23,13 +23,14 @@ project/
 
 Example
 -------
-python train.py \
+python train_multicond.py \
     --data-root hw2_data/digits \
-    --output-dir runs/cfg_digits \
-    --epochs 100 \
+    --output-dir runs/cfg_digits_multicond \
+    --epochs 10 \
     --batch-size 8 \
-    --lr 2e-4 \
-    --amp
+    --lr 1e-4 \
+    --no-amp \
+    --init-model-weights runs/cfg_digits_fp32/checkpoints/latest.pth
 """
 
 from __future__ import annotations
@@ -282,6 +283,8 @@ class TrainingConfig:
     beta_start: float
     beta_end: float
     p_uncond: float
+    p_drop_digit_only: float
+    p_drop_dataset_only: float
     condition_dim: int
     gradient_clip: float
     gradient_accumulation_steps: int
@@ -293,6 +296,7 @@ class TrainingConfig:
     amp: bool
     device: str
     resume: Optional[str]
+    init_model_weights: Optional[str]
 
 
 def load_cfg_class(project_dir: Path) -> Type[nn.Module]:
@@ -304,6 +308,7 @@ def load_cfg_class(project_dir: Path) -> Type[nn.Module]:
     """
 
     candidates = [
+        project_dir / "classifier_free_diffusion_multicond.py",
         project_dir / "classifier_free_diffusion.py",
         project_dir / "classifier-free-diffusion.py",
     ]
@@ -408,6 +413,45 @@ def resume_checkpoint(
     start_epoch = int(checkpoint.get("epoch", -1)) + 1
     global_step = int(checkpoint.get("global_step", 0))
     return start_epoch, global_step
+
+
+def initialize_model_weights(
+    path: Path,
+    diffusion: nn.Module,
+) -> Tuple[int, int]:
+    """Load model weights only and intentionally reset optimizer/scaler.
+
+    This is used to continue from the old jointly-dropped CFG checkpoint while
+    starting a new training phase with partial-condition dropout. The model
+    architecture is unchanged, so strict loading is expected to succeed.
+
+    Returns the source checkpoint's epoch and global_step for logging.
+    """
+    checkpoint = torch.load(path, map_location=diffusion.device)
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Checkpoint {path} must be a dictionary")
+
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key
+        if new_key.startswith("module."):
+            new_key = new_key[len("module.") :]
+        if new_key.startswith("model."):
+            new_key = new_key[len("model.") :]
+        cleaned_state_dict[new_key] = value
+
+    diffusion.model.load_state_dict(cleaned_state_dict, strict=True)
+    source_epoch = int(checkpoint.get("epoch", -1))
+    source_global_step = int(checkpoint.get("global_step", 0))
+    return source_epoch, source_global_step
 
 
 def save_condition_grid(
@@ -522,6 +566,8 @@ def train(config: TrainingConfig) -> None:
         beta_end=config.beta_end,
         device=str(device),
         p_uncond=config.p_uncond,
+        p_drop_digit_only=config.p_drop_digit_only,
+        p_drop_dataset_only=config.p_drop_dataset_only,
         n_digit_classes=10,
         n_dataset_classes=2,
         null_digit_idx=NULL_DIGIT_ID,
@@ -553,7 +599,22 @@ def train(config: TrainingConfig) -> None:
 
     start_epoch = 0
     global_step = 0
-    if config.resume is not None:
+
+    if config.init_model_weights is not None:
+        init_path = Path(config.init_model_weights)
+        source_epoch, source_global_step = initialize_model_weights(
+            init_path,
+            diffusion,
+        )
+        global_step = source_global_step
+        print(
+            f"Initialized model weights from {init_path}: "
+            f"source_epoch={source_epoch + 1}, "
+            f"source_global_step={source_global_step}. "
+            "Optimizer and GradScaler were reset."
+        )
+
+    elif config.resume is not None:
         resume_path = Path(config.resume)
         start_epoch, global_step = resume_checkpoint(
             resume_path,
@@ -565,6 +626,15 @@ def train(config: TrainingConfig) -> None:
             f"Resumed from {resume_path}: "
             f"start_epoch={start_epoch}, global_step={global_step}"
         )
+
+    probabilities = diffusion.condition_state_probabilities()
+    print(
+        "Condition-state probabilities: "
+        f"full={probabilities['full']:.3f}, "
+        f"dataset_only={probabilities['dataset_only']:.3f}, "
+        f"digit_only={probabilities['digit_only']:.3f}, "
+        f"unconditional={probabilities['unconditional']:.3f}"
+    )
 
     config_path = output_dir / "config.json"
     config_path.write_text(
@@ -716,7 +786,24 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=0.02)
-    parser.add_argument("--p-uncond", type=float, default=0.1)
+    parser.add_argument(
+        "--p-uncond",
+        type=float,
+        default=0.1,
+        help="Probability of dropping both digit and dataset conditions.",
+    )
+    parser.add_argument(
+        "--p-drop-digit-only",
+        type=float,
+        default=0.1,
+        help="Probability of replacing digit with null while keeping dataset.",
+    )
+    parser.add_argument(
+        "--p-drop-dataset-only",
+        type=float,
+        default=0.1,
+        help="Probability of replacing dataset with null while keeping digit.",
+    )
     parser.add_argument("--condition-dim", type=int, default=16)
 
     parser.add_argument("--gradient-clip", type=float, default=1.0)
@@ -751,6 +838,16 @@ def parse_args() -> TrainingConfig:
         help="auto, cpu, cuda, cuda:0, ...",
     )
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--init-model-weights",
+        type=str,
+        default=None,
+        help=(
+            "Load only model_state_dict from an existing checkpoint, reset "
+            "optimizer/scaler, and train --epochs new epochs. Use this for "
+            "the new multi-condition CFG phase."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -760,8 +857,27 @@ def parse_args() -> TrainingConfig:
         parser.error("--batch-size must be positive")
     if args.gradient_accumulation_steps <= 0:
         parser.error("--gradient-accumulation-steps must be positive")
-    if not 0.0 <= args.p_uncond < 1.0:
-        parser.error("--p-uncond must satisfy 0 <= p_uncond < 1")
+    for name, value in (
+        ("--p-uncond", args.p_uncond),
+        ("--p-drop-digit-only", args.p_drop_digit_only),
+        ("--p-drop-dataset-only", args.p_drop_dataset_only),
+    ):
+        if not 0.0 <= value < 1.0:
+            parser.error(f"{name} must satisfy 0 <= probability < 1")
+    if (
+        args.p_uncond
+        + args.p_drop_digit_only
+        + args.p_drop_dataset_only
+        >= 1.0
+    ):
+        parser.error(
+            "--p-uncond + --p-drop-digit-only + "
+            "--p-drop-dataset-only must be less than 1"
+        )
+    if args.resume is not None and args.init_model_weights is not None:
+        parser.error(
+            "Use either --resume or --init-model-weights, not both"
+        )
     if args.save_every <= 0:
         parser.error("--save-every must be positive")
     if args.sample_every < 0:
@@ -783,6 +899,8 @@ def parse_args() -> TrainingConfig:
         beta_start=args.beta_start,
         beta_end=args.beta_end,
         p_uncond=args.p_uncond,
+        p_drop_digit_only=args.p_drop_digit_only,
+        p_drop_dataset_only=args.p_drop_dataset_only,
         condition_dim=args.condition_dim,
         gradient_clip=args.gradient_clip,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -794,6 +912,7 @@ def parse_args() -> TrainingConfig:
         amp=args.amp,
         device=args.device,
         resume=args.resume,
+        init_model_weights=args.init_model_weights,
     )
 
 
