@@ -93,6 +93,9 @@ class DiffusionImageGenerator(nn.Module):
         self.register_buffer(
             "sqrt_recip_alpha_bars", torch.sqrt(1.0 / alpha_bars)
         )
+        self.register_buffer(
+            "sqrt_recip_alphas", torch.sqrt(1.0 / alphas)
+        )
 
         # q(x_{t-1} | x_t, x_0) posterior.
         posterior_variance = (
@@ -509,4 +512,3 @@ def example_training_step() -> None:
 if __name__ == "__main__":
     # Runs one sanity-check training step. It does not train a useful model.
     example_training_step()
-

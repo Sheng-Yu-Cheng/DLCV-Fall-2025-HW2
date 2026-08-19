@@ -11,7 +11,7 @@ LabelLike = Union[int, Sequence[int], torch.Tensor]
 
 class CFGDiffusionImageGenerator(DiffusionImageGenerator):
     """
-    Classifier-Free Guidance diffusion wrapper.
+    Classifier-Free Guidance wrapper for the joint-class conditional U-Net.
 
     Assumptions
     -----------

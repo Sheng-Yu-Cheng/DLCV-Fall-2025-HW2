@@ -1,26 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# python hw2_1/train.py \
-#   --data-root hw2_data/digits \
-#   --output-dir runs/cfg_digits_fp32 \
-#   --epochs 50 \
-#   --batch-size 8 \
-#   --lr 1e-4 \
-#   --no-amp \
-#   --sample-every 0 \
-#   --save-every 1 \
-#   --resume runs/cfg_digits_fp32/checkpoints/latest.pth
+set -euo pipefail
 
-# python hw2_1/inference.py \
-#   --checkpoint runs/cfg_digits_fp32/checkpoints/latest.pth \
-#   --output-folder output_folder \
-#   --samples-per-digit 50 \
-#   --batch-size 8 \
-#   --guidance-scale 1.0 \
-#   --overwrite
+which python3
 
-python hw2_1/diagnose-condition.py \
-  --checkpoint runs/cfg_digits_fp32/checkpoints/latest.pth \
-  --output-dir diagnose_latest \
-  --steps 50 \
-  --guidance-scale 1.0
+# TA usage:
+#   bash hw2_1.sh <output_directory>
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: bash hw2_1.sh <output_directory>" >&2
+    exit 1
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+OUTPUT_DIR="$1"
+CHECKPOINT="$ROOT_DIR/hw2_1/runs/cfg_joint_class/checkpoints/epoch_0010.pth"
+INFERENCE_SCRIPT="$ROOT_DIR/hw2_1/inference.py"
+
+if [[ ! -f "$CHECKPOINT" ]]; then
+    echo "Error: checkpoint not found: $CHECKPOINT" >&2
+    exit 1
+fi
+
+if [[ ! -f "$INFERENCE_SCRIPT" ]]; then
+    echo "Error: inference script not found: $INFERENCE_SCRIPT" >&2
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "Python: $(command -v python3)"
+echo "Checkpoint: $CHECKPOINT"
+echo "Output directory: $OUTPUT_DIR"
+
+python3 "$INFERENCE_SCRIPT" \
+    --checkpoint "$CHECKPOINT" \
+    --output-folder "$OUTPUT_DIR" \
+    --samples-per-digit 50 \
+    --batch-size 32 \
+    --steps 50 \
+    --guidance-scale 2.5
+
+echo "Image generation completed."

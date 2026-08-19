@@ -12,3 +12,5 @@ output/*
 hw2_data/*
 .vscode/*
 diagnose_latest/*
+
+output/
