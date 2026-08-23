@@ -8,6 +8,9 @@
 *.pyo
 *.bin
 
+*.ckpt
+*.pth
+
 output/*
 hw2_data/*
 .vscode/*
