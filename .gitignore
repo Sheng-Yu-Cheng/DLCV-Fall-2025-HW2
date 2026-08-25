@@ -7,9 +7,11 @@
 *.pyc
 *.pyo
 *.bin
+*.egg-info
 
 *.ckpt
 *.pth
+
 
 output/*
 hw2_data/*
