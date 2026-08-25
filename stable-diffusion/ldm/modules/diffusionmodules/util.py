@@ -15,6 +15,8 @@ import torch.nn as nn
 import numpy as np
 from einops import repeat
 
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
 from ldm.util import instantiate_from_config
 
 
@@ -98,22 +100,40 @@ def extract_into_tensor(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-
 def checkpoint(func, inputs, params, flag):
     """
-    Evaluate a function without caching intermediate activations, allowing for
-    reduced memory at the expense of extra compute in the backward pass.
-    :param func: the function to evaluate.
-    :param inputs: the argument sequence to pass to `func`.
-    :param params: a sequence of parameters `func` depends on but does not
-                   explicitly take as arguments.
-    :param flag: if False, disable gradient checkpointing.
+    Gradient checkpointing compatible with:
+      - frozen Stable Diffusion backbone
+      - trainable ControlNet
+      - PyTorch 1.11 (TA)
+      - modern PyTorch
+      - AMP
+
+    `params` is kept in the signature for compatibility with the
+    original LDM code, but PyTorch checkpoint can discover module
+    parameters through the bound forward function.
     """
-    if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
-    else:
+
+    if not flag:
         return func(*inputs)
+
+    # No point checkpointing inside torch.no_grad(), e.g. the frozen
+    # SD encoder/middle path.
+    if not torch.is_grad_enabled():
+        return func(*inputs)
+
+    # Reentrant PyTorch checkpoint requires at least one grad-requiring
+    # input. If none does, execute normally so trainable module params
+    # can still receive gradients.
+    has_grad_input = any(
+        isinstance(x, torch.Tensor) and x.requires_grad
+        for x in inputs
+    )
+
+    if not has_grad_input:
+        return func(*inputs)
+
+    return torch_checkpoint(func, *inputs)
 
 
 class CheckpointFunction(torch.autograd.Function):

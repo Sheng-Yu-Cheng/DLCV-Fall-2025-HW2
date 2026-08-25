@@ -1,3 +1,5 @@
+import copy
+
 from abc import abstractmethod
 from functools import partial
 import math
@@ -623,6 +625,11 @@ class UNetModel(nn.Module):
         )
         self._feature_size += ch
 
+        # Keep the channel layout of all encoder outputs for ControlNet.
+        # For the SD-v1 configuration used in this homework, this contains
+        # 12 entries, one for each input block / skip connection.
+        self.input_block_chans = list(input_block_chans)
+
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
@@ -707,18 +714,38 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(
+        self,
+        x,
+        timesteps=None,
+        context=None,
+        y=None,
+        control=None,
+        only_mid_control=False,
+        **kwargs,
+    ):
         """
-        Apply the model to an input batch.
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param context: conditioning plugged in via crossattn
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
+        Apply the U-Net.
+
+        When ``control`` is None, this is the original Stable Diffusion
+        forward path.
+
+        When ``control`` is provided, it must contain 13 tensors:
+          - 12 residuals for the encoder skip connections
+          - 1 residual for the middle block
+
+        This matches the ControlNet design: the pretrained SD encoder and
+        middle block are used as a locked backbone, while ControlNet residuals
+        are injected into the frozen decoder path.
         """
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
+
+        # Work on a copy because pop() is used below.
+        if control is not None:
+            control = list(control)
+
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
@@ -728,18 +755,243 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb, context)
-            hs.append(h)
-        h = self.middle_block(h, emb, context)
+
+        if control is None:
+            # Original Stable Diffusion path.
+            for module in self.input_blocks:
+                h = module(h, emb, context)
+                hs.append(h)
+            h = self.middle_block(h, emb, context)
+        else:
+            # Locked SD encoder + middle block.
+            # Decoder gradients are intentionally kept enabled so gradients
+            # can flow from the loss back into the injected ControlNet tensors.
+            with th.no_grad():
+                for module in self.input_blocks:
+                    h = module(h, emb, context)
+                    hs.append(h)
+                h = self.middle_block(h, emb, context)
+
+            if len(control) != len(self.output_blocks) + 1:
+                raise ValueError(
+                    f"Expected {len(self.output_blocks) + 1} ControlNet residuals, "
+                    f"but got {len(control)}."
+                )
+
+            # Last ControlNet output controls the middle block.
+            h = h + control.pop()
+
         for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
+            skip = hs.pop()
+
+            if control is not None and not only_mid_control:
+                skip = skip + control.pop()
+
+            h = th.cat([h, skip], dim=1)
             h = module(h, emb, context)
+
+        if control is not None and len(control) != 0:
+            raise RuntimeError(f"Unused ControlNet residuals: {len(control)}")
+
         h = h.type(x.dtype)
+
         if self.predict_codebook_ids:
             return self.id_predictor(h)
-        else:
-            return self.out(h)
+        return self.out(h)
+
+
+class ControlNet(nn.Module):
+    """
+    Trainable ControlNet branch constructed from a pretrained Stable Diffusion
+    U-Net.
+
+    The branch copies the SD timestep embedding, all encoder/input blocks,
+    and the middle block.  Each copied feature is projected through a
+    zero-initialized 1x1 convolution before being injected back into the
+    locked SD U-Net.
+
+    Parameters
+    ----------
+    pretrained_unet:
+        A fully initialized ``UNetModel`` whose pretrained weights have already
+        been loaded.
+    hint_channels:
+        Number of channels in the control image. Fill50k control images are
+        RGB, so the homework default is 3.
+    dims:
+        Spatial dimensionality. Stable Diffusion uses 2.
+    """
+
+    def __init__(self, pretrained_unet, hint_channels=3, dims=2):
+        super().__init__()
+
+        if not isinstance(pretrained_unet, UNetModel):
+            raise TypeError(
+                "pretrained_unet must be an initialized UNetModel, "
+                f"got {type(pretrained_unet)}"
+            )
+
+        self.model_channels = pretrained_unet.model_channels
+        self.dtype = pretrained_unet.dtype
+        self.num_classes = pretrained_unet.num_classes
+
+        if not hasattr(pretrained_unet, "input_block_chans"):
+            raise AttributeError(
+                "UNetModel is missing input_block_chans. "
+                "Use the ControlNet-enabled UNetModel from this file."
+            )
+
+        # Trainable copies initialized from the pretrained Stable Diffusion
+        # encoder and middle block.
+        self.time_embed = copy.deepcopy(pretrained_unet.time_embed)
+        self.input_blocks = copy.deepcopy(pretrained_unet.input_blocks)
+        self.middle_block = copy.deepcopy(pretrained_unet.middle_block)
+
+        if self.num_classes is not None:
+            self.label_emb = copy.deepcopy(pretrained_unet.label_emb)
+
+        self.input_block_chans = list(pretrained_unet.input_block_chans)
+
+        if len(self.input_block_chans) != len(self.input_blocks):
+            raise ValueError(
+                "input_block_chans and input_blocks must have equal length: "
+                f"{len(self.input_block_chans)} vs {len(self.input_blocks)}"
+            )
+
+        # Zero-convolution outputs corresponding to every encoder block.
+        self.zero_convs = nn.ModuleList(
+            [self.make_zero_conv(ch, dims) for ch in self.input_block_chans]
+        )
+
+        # The middle block has the same channel count as the deepest encoder
+        # output for this U-Net architecture.
+        middle_channels = self.input_block_chans[-1]
+        self.middle_block_out = self.make_zero_conv(middle_channels, dims)
+
+        # Control-image encoder from the original ControlNet design.
+        #
+        # 256x256 RGB control image
+        #   -> 128x128
+        #   -> 64x64
+        #   -> 32x32
+        #
+        # The final 32x32 tensor therefore matches the latent spatial
+        # resolution used by this homework's SD-v1 model.
+        self.input_hint_block = TimestepEmbedSequential(
+            conv_nd(dims, hint_channels, 16, 3, padding=1),
+            nn.SiLU(),
+
+            conv_nd(dims, 16, 16, 3, padding=1),
+            nn.SiLU(),
+
+            conv_nd(dims, 16, 32, 3, padding=1, stride=2),
+            nn.SiLU(),
+
+            conv_nd(dims, 32, 32, 3, padding=1),
+            nn.SiLU(),
+
+            conv_nd(dims, 32, 96, 3, padding=1, stride=2),
+            nn.SiLU(),
+
+            conv_nd(dims, 96, 96, 3, padding=1),
+            nn.SiLU(),
+
+            conv_nd(dims, 96, 256, 3, padding=1, stride=2),
+            nn.SiLU(),
+
+            # Zero initialization guarantees that an untrained ControlNet
+            # starts with no effect on the pretrained diffusion model.
+            zero_module(
+                conv_nd(
+                    dims,
+                    256,
+                    self.model_channels,
+                    3,
+                    padding=1,
+                )
+            ),
+        )
+
+    @staticmethod
+    def make_zero_conv(channels, dims=2):
+        return TimestepEmbedSequential(
+            zero_module(
+                conv_nd(
+                    dims,
+                    channels,
+                    channels,
+                    1,
+                    padding=0,
+                )
+            )
+        )
+
+    def forward(
+        self,
+        x,
+        hint,
+        timesteps=None,
+        context=None,
+        y=None,
+    ):
+        """
+        Return 13 zero-conv residual tensors for the controlled SD U-Net:
+        12 encoder outputs followed by 1 middle-block output.
+        """
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+
+        if hint is None:
+            raise ValueError("ControlNet requires a control image in `hint`.")
+
+        t_emb = timestep_embedding(
+            timesteps,
+            self.model_channels,
+            repeat_only=False,
+        )
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        guided_hint = self.input_hint_block(
+            hint.type(self.dtype),
+            emb,
+            context,
+        )
+
+        h = x.type(self.dtype)
+        outputs = []
+
+        for module, zero_conv in zip(self.input_blocks, self.zero_convs):
+            h = module(h, emb, context)
+
+            # The control image is fused once, immediately after the first
+            # Stable Diffusion encoder block, exactly as in ControlNet.
+            if guided_hint is not None:
+                if guided_hint.shape != h.shape:
+                    raise ValueError(
+                        "Control hint feature shape does not match the first "
+                        f"U-Net feature: hint={tuple(guided_hint.shape)}, "
+                        f"feature={tuple(h.shape)}"
+                    )
+                h = h + guided_hint
+                guided_hint = None
+
+            outputs.append(zero_conv(h, emb, context))
+
+        h = self.middle_block(h, emb, context)
+        outputs.append(self.middle_block_out(h, emb, context))
+
+        expected = len(self.input_blocks) + 1
+        if len(outputs) != expected:
+            raise RuntimeError(
+                f"Expected {expected} ControlNet outputs, got {len(outputs)}"
+            )
+
+        return outputs
 
 
 class EncoderUNetModel(nn.Module):
@@ -958,4 +1210,3 @@ class EncoderUNetModel(nn.Module):
         else:
             h = h.type(x.dtype)
             return self.out(h)
-

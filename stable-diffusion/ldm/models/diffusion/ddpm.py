@@ -16,13 +16,19 @@ from contextlib import contextmanager
 from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.distributed import rank_zero_only
+try:
+    # PyTorch Lightning 1.x (TA environment)
+    from pytorch_lightning.utilities.distributed import rank_zero_only
+except ImportError:
+    # PyTorch Lightning 2.x (development environment)
+    from pytorch_lightning.utilities import rank_zero_only
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
+from ldm.modules.diffusionmodules.openaimodel import ControlNet
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -37,6 +43,15 @@ def disabled_train(self, mode=True):
 
 def uniform_on_device(r1, r2, shape, device):
     return (r1 - r2) * torch.rand(*shape, device=device) + r2
+
+
+def torch_load_compat(path, map_location="cpu"):
+    """Load legacy checkpoints on both old and new PyTorch versions."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # PyTorch 1.11 (TA environment) has no weights_only argument.
+        return torch.load(path, map_location=map_location)
 
 
 class DDPM(pl.LightningModule):
@@ -182,7 +197,7 @@ class DDPM(pl.LightningModule):
                     print(f"{context}: Restored training weights")
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
-        sd = torch.load(path, map_location="cpu")
+        sd = torch_load_compat(path, map_location="cpu")
         if "state_dict" in list(sd.keys()):
             sd = sd["state_dict"]
         keys = list(sd.keys())
@@ -1025,7 +1040,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar.to(t.device)[t]
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
@@ -1388,6 +1403,328 @@ class LatentDiffusion(DDPM):
         x = nn.functional.conv2d(x, weight=self.colorize)
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
+
+
+class ControlLatentDiffusion(LatentDiffusion):
+    """
+    Latent Diffusion with a ControlNet branch.
+
+    The pretrained Stable Diffusion U-Net, VAE, and text encoder are frozen.
+    Only ``self.control_model`` is optimized.
+
+    Expected training batch keys by default:
+        jpg  : target RGB image, BHWC, normalized to [-1, 1]
+        txt  : prompt strings
+        hint : control RGB image, BHWC, preferably normalized to [0, 1]
+
+    ``get_input`` converts these into:
+        z             : target latent
+        c_crossattn   : CLIP text conditioning
+        c_control     : control image tensor
+    """
+
+    def __init__(
+        self,
+        control_key="hint",
+        control_hint_channels=3,
+        control_scales=None,
+        only_mid_control=False,
+        text_dropout=0.0,
+        *args,
+        **kwargs,
+    ):
+        self.control_key = control_key
+        self.control_hint_channels = int(control_hint_channels)
+        self.only_mid_control = bool(only_mid_control)
+        self.text_dropout = float(text_dropout)
+
+        if not 0.0 <= self.text_dropout <= 1.0:
+            raise ValueError("text_dropout must be in [0, 1].")
+
+        super().__init__(*args, **kwargs)
+
+        if self.model.conditioning_key != "crossattn":
+            raise ValueError(
+                "ControlLatentDiffusion currently expects "
+                "conditioning_key='crossattn'."
+            )
+
+        # Construct a trainable copy of the SD encoder + middle block.
+        # At object construction time the base U-Net may not yet contain
+        # checkpoint weights.  load_state_dict() below synchronizes the copied
+        # encoder after the pretrained SD checkpoint is loaded.
+        self.control_model = ControlNet(
+            self.model.diffusion_model,
+            hint_channels=self.control_hint_channels,
+        )
+
+        num_controls = len(self.model.diffusion_model.input_blocks) + 1
+        if control_scales is None:
+            self.control_scales = [1.0] * num_controls
+        else:
+            if len(control_scales) != num_controls:
+                raise ValueError(
+                    f"control_scales must contain {num_controls} values, "
+                    f"got {len(control_scales)}."
+                )
+            self.control_scales = [float(v) for v in control_scales]
+
+        # Freeze the original Stable Diffusion denoiser.
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def sync_control_from_unet(self):
+        """
+        Initialize the trainable ControlNet encoder/middle blocks from the
+        currently loaded Stable Diffusion U-Net.
+
+        Zero-convs and the hint encoder are intentionally NOT overwritten.
+        """
+        base = self.model.diffusion_model
+
+        self.control_model.time_embed.load_state_dict(
+            base.time_embed.state_dict()
+        )
+        self.control_model.input_blocks.load_state_dict(
+            base.input_blocks.state_dict()
+        )
+        self.control_model.middle_block.load_state_dict(
+            base.middle_block.state_dict()
+        )
+
+        if self.control_model.num_classes is not None:
+            self.control_model.label_emb.load_state_dict(
+                base.label_emb.state_dict()
+            )
+
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load ordinary SD checkpoints as well as full ControlNet checkpoints.
+
+        When an ordinary SD checkpoint is loaded, there are no
+        ``control_model.*`` keys.  After loading the pretrained U-Net weights,
+        copy its encoder/middle weights into ControlNet so ControlNet starts
+        from the pretrained SD representation rather than random weights.
+        """
+        has_control_weights = any(
+            key.startswith("control_model.") for key in state_dict.keys()
+        )
+
+        result = super().load_state_dict(state_dict, strict=strict)
+
+        if not has_control_weights:
+            self.sync_control_from_unet()
+
+        return result
+
+    def _drop_text_conditioning(self, batch):
+        """
+        Optionally replace prompts with empty strings during training.
+
+        The ControlNet paper uses prompt dropout.  Set ``text_dropout`` in the
+        YAML config (for example 0.5) to enable it.
+        """
+        if (
+            not self.training
+            or self.text_dropout <= 0.0
+            or self.cond_stage_key not in batch
+        ):
+            return batch
+
+        prompts = batch[self.cond_stage_key]
+
+        # Prompt batches from a DataLoader are normally list[str] / tuple[str].
+        if not isinstance(prompts, (list, tuple)):
+            return batch
+
+        new_batch = dict(batch)
+        dropped = []
+        for prompt in prompts:
+            if torch.rand(()) < self.text_dropout:
+                dropped.append("")
+            else:
+                dropped.append(prompt)
+        new_batch[self.cond_stage_key] = dropped
+        return new_batch
+
+    @torch.no_grad()
+    def get_input(
+        self,
+        batch,
+        k,
+        return_first_stage_outputs=False,
+        force_c_encode=False,
+        cond_key=None,
+        return_original_cond=False,
+        bs=None,
+    ):
+        batch_for_text = self._drop_text_conditioning(batch)
+
+        base_out = super().get_input(
+            batch_for_text,
+            k,
+            return_first_stage_outputs=return_first_stage_outputs,
+            force_c_encode=force_c_encode,
+            cond_key=cond_key,
+            return_original_cond=return_original_cond,
+            bs=bs,
+        )
+
+        z = base_out[0]
+        c = base_out[1]
+
+        if self.control_key not in batch:
+            raise KeyError(
+                f"Batch is missing ControlNet key '{self.control_key}'."
+            )
+
+        control = batch[self.control_key]
+
+        if not torch.is_tensor(control):
+            control = torch.as_tensor(control)
+
+        if bs is not None:
+            control = control[:bs]
+
+        # Accept either BHWC or BCHW.
+        if control.ndim == 3:
+            control = control.unsqueeze(0)
+
+        if control.ndim != 4:
+            raise ValueError(
+                "Control image must be a 4-D tensor in BHWC or BCHW form, "
+                f"got shape {tuple(control.shape)}."
+            )
+
+        if control.shape[-1] == self.control_hint_channels:
+            control = rearrange(control, "b h w c -> b c h w")
+        elif control.shape[1] != self.control_hint_channels:
+            raise ValueError(
+                f"Expected {self.control_hint_channels} control channels, "
+                f"got shape {tuple(control.shape)}."
+            )
+
+        # Convert integer images to [0, 1].
+        if not torch.is_floating_point(control):
+            control = control.float() / 255.0
+        else:
+            control = control.float()
+
+        # Be tolerant of datasets that normalized the control image to [-1, 1].
+        if control.numel() > 0:
+            control_min = float(control.min().detach().cpu())
+            control_max = float(control.max().detach().cpu())
+            if control_min >= -1.01 and control_min < -1e-6 and control_max <= 1.01:
+                control = (control + 1.0) / 2.0
+            elif control_max > 1.01:
+                control = control / 255.0
+
+        control = control.to(
+            device=self.device,
+            memory_format=torch.contiguous_format,
+        )
+
+        cond = {
+            "c_crossattn": [c],
+            "c_control": [control],
+        }
+
+        out = [z, cond]
+
+        # Preserve all optional outputs from LatentDiffusion.get_input().
+        if len(base_out) > 2:
+            out.extend(base_out[2:])
+
+        return out
+
+    def apply_model(self, x_noisy, t, cond, return_ids=False):
+        if return_ids:
+            raise NotImplementedError(
+                "ControlLatentDiffusion does not use codebook-id prediction."
+            )
+
+        if not isinstance(cond, dict):
+            cond = {"c_crossattn": [cond]}
+
+        if "c_crossattn" not in cond:
+            raise KeyError("Conditioning dict is missing 'c_crossattn'.")
+
+        if "c_control" not in cond:
+            # Allow running the same class without control for debugging.
+            cc = torch.cat(cond["c_crossattn"], 1)
+            return self.model.diffusion_model(
+                x_noisy,
+                t,
+                context=cc,
+            )
+
+        cc = torch.cat(cond["c_crossattn"], 1)
+        hint = torch.cat(cond["c_control"], 1)
+
+        control = self.control_model(
+            x=x_noisy,
+            hint=hint,
+            timesteps=t,
+            context=cc,
+        )
+
+        if len(control) != len(self.control_scales):
+            raise RuntimeError(
+                f"ControlNet produced {len(control)} residuals but "
+                f"{len(self.control_scales)} scales are configured."
+            )
+
+        control = [
+            residual * scale
+            for residual, scale in zip(control, self.control_scales)
+        ]
+
+        return self.model.diffusion_model(
+            x_noisy,
+            t,
+            context=cc,
+            control=control,
+            only_mid_control=self.only_mid_control,
+        )
+
+    def configure_optimizers(self):
+        # Only ControlNet is trainable.
+        params = [
+            param
+            for param in self.control_model.parameters()
+            if param.requires_grad
+        ]
+
+        if len(params) == 0:
+            raise RuntimeError("ControlNet has no trainable parameters.")
+
+        opt = torch.optim.AdamW(params, lr=self.learning_rate)
+
+        if self.use_scheduler:
+            assert "target" in self.scheduler_config
+            scheduler = instantiate_from_config(self.scheduler_config)
+            scheduler = [{
+                "scheduler": LambdaLR(
+                    opt,
+                    lr_lambda=scheduler.schedule,
+                ),
+                "interval": "step",
+                "frequency": 1,
+            }]
+            return [opt], scheduler
+
+        return opt
+
+    def get_control_state_dict(self):
+        """
+        Return only trainable ControlNet weights.
+
+        This is useful for saving a submission checkpoint without duplicating
+        the frozen Stable Diffusion / VAE / CLIP weights.
+        """
+        return self.control_model.state_dict()
+
 
 
 class DiffusionWrapper(pl.LightningModule):

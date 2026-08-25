@@ -39,7 +39,11 @@ def numpy_to_pil(images):
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
+    try:
+        pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+    except TypeError:
+        # PyTorch 1.11 compatibility
+        pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
